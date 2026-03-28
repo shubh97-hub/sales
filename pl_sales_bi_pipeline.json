@@ -1,0 +1,153 @@
+{
+  "name": "pl_sales_bi_pipeline",
+  "properties": {
+    "description": "End-to-end Sales BI Pipeline using Medallion Architecture (Bronze → Silver → Gold). Triggered daily by ADF schedule trigger.",
+    "activities": [
+
+      {
+        "name": "Copy_Raw_To_ADLS",
+        "description": "Copy SaleData.xlsx from source (e.g., HTTP / Blob / SFTP) into ADLS Gen2 raw container.",
+        "type": "Copy",
+        "dependsOn": [],
+        "policy": { "timeout": "0.00:10:00", "retry": 2, "retryIntervalInSeconds": 30 },
+        "typeProperties": {
+          "source": {
+            "type": "ExcelSource",
+            "storeSettings": {
+              "type": "AzureBlobStorageReadSettings",
+              "recursive": false
+            }
+          },
+          "sink": {
+            "type": "AzureBlobFSSink",
+            "storeSettings": {
+              "type": "AzureBlobFSWriteSettings"
+            }
+          },
+          "enableStaging": false
+        },
+        "inputs": [{
+          "referenceName": "ds_source_saledata_excel",
+          "type": "DatasetReference"
+        }],
+        "outputs": [{
+          "referenceName": "ds_adls_raw_saledata",
+          "type": "DatasetReference"
+        }]
+      },
+
+      {
+        "name": "Bronze_Ingestion",
+        "description": "Run PySpark notebook to ingest raw Excel into Bronze Delta layer.",
+        "type": "DatabricksNotebook",
+        "dependsOn": [{
+          "activity": "Copy_Raw_To_ADLS",
+          "dependencyConditions": ["Succeeded"]
+        }],
+        "policy": { "timeout": "0.01:00:00", "retry": 1, "retryIntervalInSeconds": 60 },
+        "typeProperties": {
+          "notebookPath": "/Repos/sales-bi-pipeline/etl/01_bronze_ingestion",
+          "baseParameters": {
+            "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" }
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_databricks_cluster",
+          "type": "LinkedServiceReference"
+        }
+      },
+
+      {
+        "name": "Silver_Transformation",
+        "description": "Clean, validate and enrich data into Silver Delta layer.",
+        "type": "DatabricksNotebook",
+        "dependsOn": [{
+          "activity": "Bronze_Ingestion",
+          "dependencyConditions": ["Succeeded"]
+        }],
+        "policy": { "timeout": "0.01:00:00", "retry": 1, "retryIntervalInSeconds": 60 },
+        "typeProperties": {
+          "notebookPath": "/Repos/sales-bi-pipeline/etl/02_silver_transform",
+          "baseParameters": {
+            "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" }
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_databricks_cluster",
+          "type": "LinkedServiceReference"
+        }
+      },
+
+      {
+        "name": "Data_Quality_Checks",
+        "description": "Run DQ validation suite on Silver layer. Halt pipeline on failure.",
+        "type": "DatabricksNotebook",
+        "dependsOn": [{
+          "activity": "Silver_Transformation",
+          "dependencyConditions": ["Succeeded"]
+        }],
+        "policy": { "timeout": "0.00:20:00", "retry": 0 },
+        "typeProperties": {
+          "notebookPath": "/Repos/sales-bi-pipeline/etl/04_data_quality_checks",
+          "baseParameters": {
+            "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" }
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_databricks_cluster",
+          "type": "LinkedServiceReference"
+        }
+      },
+
+      {
+        "name": "Gold_Aggregation",
+        "description": "Build curated Gold Delta tables for Power BI consumption.",
+        "type": "DatabricksNotebook",
+        "dependsOn": [{
+          "activity": "Data_Quality_Checks",
+          "dependencyConditions": ["Succeeded"]
+        }],
+        "policy": { "timeout": "0.01:00:00", "retry": 1, "retryIntervalInSeconds": 60 },
+        "typeProperties": {
+          "notebookPath": "/Repos/sales-bi-pipeline/etl/03_gold_aggregation",
+          "baseParameters": {
+            "storage_account": { "value": "@pipeline().parameters.storage_account", "type": "Expression" }
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_databricks_cluster",
+          "type": "LinkedServiceReference"
+        }
+      },
+
+      {
+        "name": "Notify_On_Failure",
+        "description": "Send email alert on any pipeline failure.",
+        "type": "WebActivity",
+        "dependsOn": [
+          { "activity": "Bronze_Ingestion",      "dependencyConditions": ["Failed"] },
+          { "activity": "Silver_Transformation", "dependencyConditions": ["Failed"] },
+          { "activity": "Data_Quality_Checks",   "dependencyConditions": ["Failed"] },
+          { "activity": "Gold_Aggregation",      "dependencyConditions": ["Failed"] }
+        ],
+        "typeProperties": {
+          "url": "@pipeline().parameters.alert_webhook_url",
+          "method": "POST",
+          "body": {
+            "text": "@concat('Sales BI Pipeline FAILED at: ', activity('Bronze_Ingestion').Status, ' | Run ID: ', pipeline().RunId)"
+          }
+        }
+      }
+
+    ],
+    "parameters": {
+      "storage_account":    { "type": "string", "defaultValue": "your_storage_account" },
+      "alert_webhook_url":  { "type": "string", "defaultValue": "https://your-webhook-url" }
+    },
+    "variables": {
+      "pipeline_status": { "type": "String", "defaultValue": "Running" }
+    },
+    "annotations": ["SalesPipeline", "Medallion", "PowerBI", "Delta"],
+    "concurrency": 1
+  }
+}
